@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <libgen.h>
 
 #include "getopt_long.h"
 
@@ -42,19 +43,22 @@ static void do_help(const char *arg0, int exitval)
         "[--no-verify|-n] [--pkt-dump|-p] pkt_num {--mak|-m} mak "
         "[--metadata|-D] [{--out|-o} outfile] <tivofile>\n\n"
         " -m, --mak         media access key (required)\n"
-        " -o, --out,        output file (default stdout)\n"
+        " -o, --out,        output file (see notes for default)\n"
         " -v, --verbose,    verbose\n"
         " -p, --pkt-dump,   verbose logging for specific TS packet number\n"
         " -D, --metadata,   dump TiVo recording metadata\n"
         " -n, --no-verify,  do not verify MAK while decoding\n"
         " -x, --no-video,   don't decode video, exit after metadata\n"
         " -V, --version,    print the version information and exit\n"
-        " -h, --help,       print this help and exit\n\n"
-        "The file names specified for the output file or the tivo\n"
-        "file may be -, which means stdout or stdin respectively\n\n";
+        " -h, --help,       print this help and exit\n"
+        "\n"
+        "The file names specified for the output file or the tivo file\n"
+        "may be -, which indicates stdout or stdin, respectively.\n"
+        "If the output file is not set explicitly, then " << arg0 << " will synthesize\n"
+        "one derived from the tivo file and the metadata it contains.\n"
+        "\n";
     std::exit(exitval);
 }
-
 
 
 const unsigned long hashTitle         = 0x0aebc065;
@@ -69,7 +73,7 @@ char *parseMetadata(char *data)
     char *p;
     char *t, tag[32];
     char *v, val[256];
-    char last;
+    char prev;
     unsigned long tagHash;
     enum {
         between,
@@ -88,7 +92,7 @@ char *parseMetadata(char *data)
     int     n;
 
     tagHash = 0;
-    last = '\0';
+    prev = '\0';
     p = data;
     t = tag;
     v = val;
@@ -106,7 +110,7 @@ char *parseMetadata(char *data)
             switch (state)
             {
             case openingTag:
-                if (last != '/')
+                if (prev != '/')
                 {
                     v = val;
                     state = value;
@@ -152,7 +156,7 @@ char *parseMetadata(char *data)
             break;
 
         case '/':
-            if (last == '<')
+            if (prev == '<')
                 state = closingTag;
             break;
 
@@ -166,16 +170,29 @@ char *parseMetadata(char *data)
             }
             break;
         };
-        last = *p++;
+        prev = *p++;
     }
 
     if (isSeries)
-        std::snprintf(val, sizeof(val), "%s - S%02dE%02d - %s", seriesTitle, seasonNumber, episodeNumber, episodeTitle);
-    else if (movieYear != -1)
-        std::snprintf(val, sizeof(val), "%s (%d)", title, movieYear);
-    else
-        std::snprintf(val, sizeof(val), "%s", title);
+    {
+        if (seriesTitle == NULL || episodeTitle == NULL)
+            return NULL;
 
+        if (seasonNumber == -1 && episodeNumber == -1)
+            std::snprintf(val, sizeof(val), "%s - %s", seriesTitle, episodeTitle);
+        else
+            std::snprintf(val, sizeof(val), "%s - S%02dE%02d - %s", seriesTitle, seasonNumber, episodeNumber, episodeTitle);
+    }
+    else
+    {
+        if (title == NULL)
+            return NULL;
+
+        if (movieYear != -1)
+            std::snprintf(val, sizeof(val), "%s (%d)", title, movieYear);
+        else
+            std::snprintf(val, sizeof(val), "%s", title);
+    }
     return strdup(val);
 }
 
@@ -204,7 +221,7 @@ char *extract(char *data, int size)
     if (strE == NULL) return NULL;
     *strE = '\0';
 
-    // std::fprintf(stderr,"metadata: \'%s\'\n",strB);
+    std::fprintf(stderr,"metadata: \'%s\'\n",strB);
 
     result = parseMetadata(strB);
 
@@ -221,9 +238,9 @@ int main(int argc, char *argv[])
     uint32_t pktDump = 0;
 
     const char *tivofile   = NULL;
-          char *outfile    = NULL;
-          char *basepath   = NULL;
-          char *renamefile = NULL;
+          char *destfile   = NULL;
+          char *destpath   = NULL;
+          char *destbase   = NULL;
 
     char mak[12];
     std::memset(mak, 0, sizeof(mak));
@@ -259,7 +276,7 @@ int main(int argc, char *argv[])
                 pktDumpMap[pktDump] = true;
                 break;
             case 'o':
-                outfile = optarg;
+                destfile = optarg;
                 break;
             case 'h':
                 do_help(argv[0], 1);
@@ -303,16 +320,22 @@ int main(int argc, char *argv[])
         do_help(argv[0], 5);
     }
 
-    basepath = (char *)std::malloc(std::strlen(tivofile));
-    if (basepath != NULL)
-    {
-        std::strcpy(basepath,tivofile);
+    char *p = destfile;
+    if (p == NULL)
+        p = (char *)tivofile;
 
-        /* if there's an extension, lop it off */
-        char *dot = std::strrchr(basepath,'.');
-        if (dot != NULL && std::strlen(dot) < 6)
-            *dot = '\0';
-    }
+    p = strdup(p);
+    destpath = strdup(dirname(p));
+    destbase = strdup(basename(p));
+
+    /* if there's an extension, lop it off */
+    char *dot = std::strrchr(destbase,'.');
+    if (dot != NULL && std::strlen(dot) < 6)
+        *dot = '\0';
+
+    print_qualcomm_msg();
+
+    fprintf(stderr, "reading from %s\n", tivofile);
 
     hfh = new HappyFile;
 
@@ -329,8 +352,6 @@ int main(int argc, char *argv[])
             return 6;
         }
     }
-
-    print_qualcomm_msg();
 
     if (false == header.read(hfh))
     {
@@ -378,13 +399,16 @@ int main(int argc, char *argv[])
 
         if (pChunks[i].id == 1)
         {
-            renamefile = extract((char *)pChunks[i].pData,pChunks[i].dataSize);
+            char *p;
+            p = extract((char *)pChunks[i].pData,pChunks[i].dataSize);
+            if (p != NULL)
+                destbase = p;
         }
 
         if (o_dump_metadata)
         {
-            char *buf = (char *)malloc(strlen(basepath) + 16);
-            std::sprintf(buf, "%s-%02d-%04x.xml", basepath, i, pChunks[i].id);
+            char *buf = (char *)malloc(strlen(destpath) + 16);
+            std::sprintf(buf, "%s/%s-%02d-%04x.xml", destpath, destbase, i, pChunks[i].id);
 
             HappyFile *chunkfh = new HappyFile;
             if (!chunkfh->open(buf, "wb"))
@@ -420,47 +444,37 @@ int main(int argc, char *argv[])
 
     ofh = new HappyFile;
 
-    if (!outfile) /* outfile not set, so derive one from tivofile */
+    if (destfile == NULL) /* destfile not given on cmdline, so derive one from tivofile and metadata */
     {
-        if (renamefile != NULL)
-        {
-            basepath = (char *)realloc(basepath, strlen(basepath) + strlen(renamefile));
-
-            char *p = strrchr(basepath, '/');
-            if (p != NULL) p[1] = '\0';
-            else *basepath = '\0';
-
-            strcat(basepath, renamefile);
-        }
-
         const char *extn;
 
         switch (header.getFormatType())
         {
         case TIVO_FORMAT_PS:
-            extn = ".mpg";
+            extn = "mpg";
             break;
         case TIVO_FORMAT_TS:
-            extn = ".ts";
+            extn = "ts";
             break;
         default:
-            extn = ".bin";
+            extn = "bin";
             break;
         }
 
-        outfile = (char *)std::malloc(strlen(basepath) + strlen(extn) + 1);
-        std::strcpy(outfile,basepath);
-        std::strcat(outfile,extn);
+        destfile = (char *)std::malloc(strlen(destpath) + strlen(destbase) + strlen(extn) + 3);
+        sprintf(destfile, "%s/%s.%s", destpath, destbase, extn);
     }
 
-    if (!std::strcmp(outfile, "-"))
+    fprintf(stderr, "writing to %s\n", destfile);
+
+    if (!std::strcmp(destfile, "-"))
     {
         if (!ofh->attach(stdout))
             return 10;
     }
     else
     {
-        if (!ofh->open(outfile, "wb"))
+        if (!ofh->open(destfile, "wb"))
         {
             std::perror("opening output file");
             return 7;
